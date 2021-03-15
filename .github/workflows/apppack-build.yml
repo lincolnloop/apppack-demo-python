@@ -1,0 +1,71 @@
+name: apppack-build
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    env:
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-python@v2
+        with:
+          python-version: 3.9
+      - name: Setup
+        run: |
+          sudo curl -sLo /usr/local/bin/yj https://github.com/bruceadams/yj/releases/download/1.1.25/yj.yj.linux
+          sudo chmod +x /usr/local/bin/yj
+          curl -sLo /tmp/go-containerregistry_Linux_x86_64.tar.gz https://github.com/google/go-containerregistry/releases/download/v0.4.1/go-containerregistry_Linux_x86_64.tar.gz
+          sudo tar xvzf /tmp/go-containerregistry_Linux_x86_64.tar.gz -C /usr/local/bin crane
+          pip install --quiet awscli
+      - name: Build
+        id: build
+        run: |
+          set -euf -o pipefail
+          aws codebuild batch-get-projects --names "$APPNAME" --query 'projects[0]' > build.json
+          export DOCKER_REPO=$(jq -r '.environment.environmentVariables[] | select(.name == "DOCKER_REPO") | .value' < build.json)
+          export PIPELINE="$(jq -r '.environment.environmentVariables[] | select(.name == "PIPELINE") | .value' < build.json)"
+          export DOCKERHUB_USERNAME=$(aws ssm get-parameters --names /apppack/account/dockerhub-username --query Parameters[0].Value --output text)
+          export DOCKERHUB_ACCESS_TOKEN=$(aws ssm get-parameters --names /apppack/account/dockerhub-access-token --with-decryption --query Parameters[0].Value --output text)
+          jq -r .source.buildspec < build.json > buildspec.yml
+          yj < buildspec.yml | jq -r .phases.install.commands > script.sh
+          yj < buildspec.yml | jq -r .phases.pre_build.commands >> script.sh
+          yj < buildspec.yml | jq -r .phases.build.commands >> script.sh
+          bash script.sh
+          ARTIFACTS_BUCKET="$(jq -r .artifacts.location < build.json)"
+          touch test.log
+          for FILE in $(yj < buildspec.yml | jq -r '.artifacts.files[]'); do
+            aws s3 cp $FILE "s3://$ARTIFACTS_BUCKET/$CODEBUILD_BUILD_NUMBER/"
+          done
+          echo "::set-output name=artifacts_bucket::$ARTIFACTS_BUCKET"
+          echo "::set-output name=docker_repo::$DOCKER_REPO"
+        env:
+          BRANCH: ${{ github.ref }}
+          CODEBUILD_BUILD_ID: external-${{ github.run_id }}
+          CODEBUILD_BUILD_NUMBER: external-${{ github.run_number }}
+          APPNAME: python-demo
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - name: Trigger Deploy
+        run: |-
+          echo 'version: 0.2
+          artifacts:
+            files: [build.log, test.log, metadata.toml, app.json, commit.txt]
+            name: $CODEBUILD_BUILD_NUMBER
+          phases:
+            build:
+              commands: aws s3 cp --recursive s3://${{ steps.build.outputs.artifacts_bucket }}/external-${{ github.run_number }}/ .
+          ' > buildspec.yml
+          set -ex
+          CODEBUILD_BUILD_NUMBER=$(aws codebuild start-build \
+            --project-name "$APPNAME" \
+            --source-version "${{ github.sha }}" \
+            --buildspec-override "$(cat buildspec.yml)" \
+            --query build.buildNumber --output text)
+          # Using docker results in a different image digest, crane will have the same image digest
+          crane tag "${{ steps.build.outputs.docker_repo }}:${{ github.sha }}" "build-$CODEBUILD_BUILD_NUMBER"
+        env:
+          APPNAME: python-demo
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
